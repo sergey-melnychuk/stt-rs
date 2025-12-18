@@ -1,0 +1,51 @@
+[package]
+name = "stt-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Radio Speech-to-Text System"
+authors = ["STT-RS Team"]
+
+[[bin]]
+name = "stt-rs"
+path = "src/main.rs"
+
+[lib]
+name = "stt_rs"
+path = "src/lib.rs"
+
+[dependencies]
+# Audio I/O
+cpal = "0.15"
+hound = "3.5"
+
+# Signal processing
+rubato = "0.15"
+biquad = "0.4"
+
+# STT Engine
+whisper-rs = "0.13"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI and config
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+ctrlc = "3.4"
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,55 @@
+# STT-RS Configuration Example
+# Copy this file to config.toml and modify as needed
+
+[audio]
+# Target sample rate (Hz) - 16000 is standard for STT
+sample_rate = 16000
+# Number of channels (1 = mono)
+channels = 1
+# Buffer size in samples
+buffer_size = 512
+# Audio device name (comment out to use default)
+# device = "MacBook Pro Microphone"
+
+[preprocessing]
+# Enable resampling to target sample rate
+enable_resampling = true
+# Enable filtering for radio voice band
+enable_filtering = true
+# High-pass filter cutoff (Hz) - removes DC offset and rumble
+high_pass_cutoff = 300.0
+# Low-pass filter cutoff (Hz) - radio voice band limit
+low_pass_cutoff = 3400.0
+# Enable audio normalization
+enable_normalization = true
+# Enable Voice Activity Detection
+enable_vad = true
+# VAD energy threshold (0.0 - 1.0)
+vad_threshold = 0.05
+# Minimum speech duration (seconds)
+vad_min_speech_duration = 0.25
+# Minimum silence duration (seconds)
+vad_min_silence_duration = 0.5
+
+[stt]
+# Path to Whisper model file
+# Download from: https://huggingface.co/ggerganov/whisper.cpp/tree/main
+model_path = "./models/ggml-base.en.bin"
+# Model size: tiny, base, small, medium, large
+model_size = "base"
+# Language for transcription
+language = "en"
+# Number of threads for inference
+threads = 4
+# Enable translation to English
+translate = false
+
+[output]
+# Output format: text, json, srt, vtt
+format = "text"
+# Output file path (comment out for console only)
+# output_path = "./transcriptions/output.txt"
+# Include timestamps in output
+enable_timestamps = true
+# Enable console output
+enable_console = true
