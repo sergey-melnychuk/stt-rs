@@ -2,8 +2,24 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+/// Suppress whisper.cpp logging
+fn suppress_whisper_logging() {
+    // No-op callback to suppress all whisper.cpp output
+    unsafe extern "C" fn noop_log_callback(
+        _level: whisper_rs::whisper_rs_sys::ggml_log_level,
+        _text: *const std::os::raw::c_char,
+        _user_data: *mut std::os::raw::c_void,
+    ) {
+        // Do nothing - suppress all logs
+    }
+
+    unsafe {
+        whisper_rs::whisper_rs_sys::whisper_log_set(Some(noop_log_callback), std::ptr::null_mut());
+    }
+}
 
 use crate::config::SttConfig;
 use crate::error::{Result, SttEngineError};
@@ -50,7 +66,7 @@ impl SttEngine {
             .into());
         }
 
-        info!("Loading Whisper model from: {}", model_path.display());
+        suppress_whisper_logging();
 
         let ctx_params = WhisperContextParameters::default();
         let ctx = WhisperContext::new_with_params(
@@ -58,8 +74,6 @@ impl SttEngine {
             ctx_params,
         )
         .map_err(|e| SttEngineError::ModelLoad(e.to_string()))?;
-
-        info!("Whisper model loaded successfully");
 
         Ok(Self {
             ctx: Arc::new(ctx),

@@ -94,9 +94,9 @@ impl Default for PreprocessingConfig {
             low_pass_cutoff: 3400.0,
             enable_normalization: true,
             enable_vad: true,
-            vad_threshold: 0.05,
+            vad_threshold: 0.01,  // Lower threshold for better sensitivity
             vad_min_speech_duration: 0.25,
-            vad_min_silence_duration: 0.5,
+            vad_min_silence_duration: 0.3,  // Faster segment completion
         }
     }
 }
@@ -123,7 +123,7 @@ impl Default for SttConfig {
             model_path: PathBuf::from("./models/ggml-base.en.bin"),
             model_size: ModelSize::Base,
             language: "en".to_string(),
-            threads: 4,
+            threads: 8,
             translate: false,
         }
     }

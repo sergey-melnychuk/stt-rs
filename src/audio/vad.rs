@@ -62,7 +62,8 @@ impl VoiceActivityDetector {
         self.energy_avg = self.energy_alpha * energy + (1.0 - self.energy_alpha) * self.energy_avg;
 
         // Determine if this frame is speech based on energy
-        let is_speech = energy > self.threshold && energy > self.energy_avg * 1.5;
+        // Use either absolute threshold OR relative to average (not both)
+        let is_speech = energy > self.threshold || (self.energy_avg > 0.001 && energy > self.energy_avg * 2.0);
 
         // State machine with hysteresis
         match (self.current_state, is_speech) {
@@ -151,12 +152,15 @@ pub struct SpeechSegmenter {
     pre_roll_samples: usize,
     /// Pre-roll buffer
     pre_roll_buffer: Vec<f32>,
+    /// Maximum segment duration in samples (forces segment completion)
+    max_segment_samples: usize,
 }
 
 impl SpeechSegmenter {
     /// Create a new speech segmenter
     pub fn new(config: &PreprocessingConfig, sample_rate: u32) -> Self {
         let pre_roll_samples = (0.2 * sample_rate as f32) as usize; // 200ms pre-roll
+        let max_segment_samples = (10.0 * sample_rate as f32) as usize; // 10 second max segment
 
         Self {
             vad: VoiceActivityDetector::new(config, sample_rate),
@@ -166,6 +170,7 @@ impl SpeechSegmenter {
             segment_start: 0,
             pre_roll_samples,
             pre_roll_buffer: Vec::with_capacity(pre_roll_samples),
+            max_segment_samples,
         }
     }
 
@@ -187,6 +192,19 @@ impl SpeechSegmenter {
                         self.current_segment.extend(&self.pre_roll_buffer);
                     }
                     self.current_segment.extend(chunk);
+
+                    // Force segment completion if max duration exceeded
+                    if self.current_segment.len() >= self.max_segment_samples {
+                        trace!("VAD: Forcing segment completion (max duration reached)");
+                        let segment = SpeechSegment {
+                            start: self.segment_start as f32 / self.sample_rate as f32,
+                            end: self.sample_position as f32 / self.sample_rate as f32,
+                            samples: std::mem::take(&mut self.current_segment),
+                        };
+                        segments.push(segment);
+                        // Start new segment immediately since speech is ongoing
+                        self.segment_start = self.sample_position;
+                    }
                 }
                 VadResult::Silence => {
                     if !self.current_segment.is_empty() {

@@ -23,7 +23,7 @@ rubato = "0.15"
 biquad = "0.4"
 
 # STT Engine
-whisper-rs = "0.13"
+whisper-rs = { version = "0.13", features = ["raw-api"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

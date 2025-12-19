@@ -15,6 +15,7 @@ pub struct AudioPreprocessor {
     low_pass_filter: Option<DirectForm1<f32>>,
     source_sample_rate: u32,
     target_sample_rate: u32,
+    resample_buffer: Vec<f32>,
 }
 
 impl AudioPreprocessor {
@@ -31,6 +32,7 @@ impl AudioPreprocessor {
             low_pass_filter: None,
             source_sample_rate,
             target_sample_rate,
+            resample_buffer: Vec::new(),
         };
 
         preprocessor.init()?;
@@ -124,55 +126,28 @@ impl AudioPreprocessor {
 
     fn do_resample(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
         let resampler = self.resampler.as_mut().unwrap();
-        let input_frames_needed = resampler.input_frames_next();
 
-        if samples.len() < input_frames_needed {
-            // Pad with zeros if not enough samples
-            let mut padded = samples.to_vec();
-            padded.resize(input_frames_needed, 0.0);
+        // Add new samples to buffer
+        self.resample_buffer.extend_from_slice(samples);
+
+        let input_frames_needed = resampler.input_frames_next();
+        let mut output = Vec::new();
+
+        // Process complete chunks only - no zero padding
+        while self.resample_buffer.len() >= input_frames_needed {
+            let chunk: Vec<f32> = self.resample_buffer.drain(..input_frames_needed).collect();
 
             let result = resampler
-                .process(&[padded], None)
+                .process(&[chunk], None)
                 .map_err(|e| AudioError::Resampling(e.to_string()))?;
 
-            Ok(result.into_iter().next().unwrap_or_default())
-        } else {
-            // Process in chunks
-            let mut output = Vec::new();
-            let mut remaining = samples;
-
-            while remaining.len() >= input_frames_needed {
-                let (chunk, rest) = remaining.split_at(input_frames_needed);
-                remaining = rest;
-
-                let result = resampler
-                    .process(&[chunk.to_vec()], None)
-                    .map_err(|e| AudioError::Resampling(e.to_string()))?;
-
-                if let Some(resampled) = result.into_iter().next() {
-                    output.extend(resampled);
-                }
+            if let Some(resampled) = result.into_iter().next() {
+                output.extend(resampled);
             }
-
-            // Handle remaining samples
-            if !remaining.is_empty() {
-                let mut padded = remaining.to_vec();
-                padded.resize(input_frames_needed, 0.0);
-
-                let result = resampler
-                    .process(&[padded], None)
-                    .map_err(|e| AudioError::Resampling(e.to_string()))?;
-
-                if let Some(resampled) = result.into_iter().next() {
-                    // Only take proportional amount of output
-                    let ratio = remaining.len() as f32 / input_frames_needed as f32;
-                    let take = (resampled.len() as f32 * ratio) as usize;
-                    output.extend(&resampled[..take.min(resampled.len())]);
-                }
-            }
-
-            Ok(output)
         }
+
+        // Keep remaining samples in buffer for next call
+        Ok(output)
     }
 
     fn normalize(&self, samples: &[f32]) -> Vec<f32> {
@@ -202,7 +177,7 @@ impl AudioPreprocessor {
         self.target_sample_rate
     }
 
-    /// Reset filter states
+    /// Reset filter states and buffers
     pub fn reset(&mut self) {
         if let Some(ref mut filter) = self.high_pass_filter {
             filter.reset_state();
@@ -210,6 +185,7 @@ impl AudioPreprocessor {
         if let Some(ref mut filter) = self.low_pass_filter {
             filter.reset_state();
         }
+        self.resample_buffer.clear();
     }
 }
 

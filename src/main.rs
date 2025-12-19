@@ -7,11 +7,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tracing::{debug, info, warn, Level};
+use tracing::{info, Level};
 use tracing_subscriber::EnvFilter;
 
 use stt_rs::{AudioCapture, AudioPreprocessor, Config, OutputWriter, SttEngine};
-use stt_rs::audio::vad::SpeechSegmenter;
 
 /// Radio Speech-to-Text System
 #[derive(Parser)]
@@ -50,6 +49,10 @@ enum Commands {
         #[arg(short, long, default_value = "text")]
         format: String,
 
+        /// Language code (e.g., en, ru, de, fr, es, zh, ja)
+        #[arg(short, long)]
+        language: Option<String>,
+
         /// Disable console output
         #[arg(long)]
         no_console: bool,
@@ -85,17 +88,22 @@ enum Commands {
         /// Output format (text, json, srt, vtt)
         #[arg(short, long, default_value = "text")]
         format: String,
+
+        /// Language code (e.g., en, ru, de, fr, es, zh, ja)
+        #[arg(short, long)]
+        language: Option<String>,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Setup logging
+    // Setup logging - quiet by default, use -v for more
     let log_level = match cli.verbose {
-        0 => Level::WARN,
-        1 => Level::INFO,
-        2 => Level::DEBUG,
+        0 => Level::ERROR,
+        1 => Level::WARN,
+        2 => Level::INFO,
+        3 => Level::DEBUG,
         _ => Level::TRACE,
     };
 
@@ -120,6 +128,7 @@ fn main() -> Result<()> {
             model,
             output,
             format,
+            language,
             no_console,
         } => {
             // Apply CLI overrides
@@ -128,6 +137,9 @@ fn main() -> Result<()> {
             }
             if let Some(model) = model {
                 config.stt.model_path = model;
+            }
+            if let Some(language) = language {
+                config.stt.language = language;
             }
             if let Some(output) = output {
                 config.output.output_path = Some(output);
@@ -157,9 +169,13 @@ fn main() -> Result<()> {
             input,
             model,
             format,
+            language,
         } => {
             if let Some(model) = model {
                 config.stt.model_path = model;
+            }
+            if let Some(language) = language {
+                config.stt.language = language;
             }
             config.output.format = match format.as_str() {
                 "json" => stt_rs::config::OutputFormat::Json,
@@ -192,9 +208,12 @@ fn run_realtime(config: Config) -> Result<()> {
     let actual_sample_rate = capture.actual_sample_rate();
     info!("Audio capture initialized at {} Hz", actual_sample_rate);
 
-    // Initialize preprocessor
+    // Initialize preprocessor - disable filtering, just resample
+    let mut preproc_config = config.preprocessing.clone();
+    preproc_config.enable_filtering = false;
+    preproc_config.enable_normalization = false;
     let mut preprocessor = AudioPreprocessor::new(
-        config.preprocessing.clone(),
+        preproc_config,
         actual_sample_rate,
         16000, // Whisper expects 16kHz
     )
@@ -211,98 +230,75 @@ fn run_realtime(config: Config) -> Result<()> {
         .context("Failed to create output writer")?;
     output.write_header()?;
 
-    // Initialize speech segmenter
-    let mut segmenter = SpeechSegmenter::new(&config.preprocessing, 16000);
+    // Audio buffer - 5 second windows
+    let window_seconds = 5.0;
+    let window_samples = (16000.0 * window_seconds) as usize;
+    let mut audio_buffer: Vec<f32> = Vec::with_capacity(window_samples * 2);
 
-    // Audio buffer for accumulating samples
-    let mut audio_buffer: Vec<f32> = Vec::new();
-    let window_duration = 5.0; // 5 second windows
-    let window_samples = (16000.0 * window_duration) as usize;
+    // Energy threshold for silence detection (skip silent chunks)
+    let silence_threshold = 0.01;
+
+    // Max buffer size before dropping old audio (15 seconds = 3 windows)
+    let max_buffer_samples = window_samples * 3;
 
     // Start capture
     capture.start().context("Failed to start audio capture")?;
 
     let start_time = Instant::now();
-    let mut last_transcription = Instant::now();
-
     info!("Listening... Press Ctrl+C to stop");
 
     while running.load(Ordering::SeqCst) {
-        // Get audio samples
-        if let Some(samples) = capture.receive_timeout(Duration::from_millis(100)) {
-            // Preprocess audio
+        // Drain all available audio to prevent buffer overflow
+        let mut got_samples = false;
+        while let Some(samples) = capture.try_receive() {
             let processed = preprocessor.process(&samples)?;
+            audio_buffer.extend(&processed);
+            got_samples = true;
+        }
 
-            // Process through speech segmenter
-            let segments = segmenter.process(&processed);
+        // If no samples available, wait a bit
+        if !got_samples {
+            if let Some(samples) = capture.receive_timeout(Duration::from_millis(50)) {
+                let processed = preprocessor.process(&samples)?;
+                audio_buffer.extend(&processed);
+            }
+        }
 
-            for segment in segments {
-                if segment.samples.len() >= 16000 / 4 {
-                    // At least 250ms of speech
-                    debug!(
-                        "Speech segment: {:.2}s - {:.2}s ({} samples)",
-                        segment.start,
-                        segment.end,
-                        segment.samples.len()
-                    );
+        // Drop old audio if we're falling behind
+        if audio_buffer.len() > max_buffer_samples {
+            let drop_count = audio_buffer.len() - window_samples;
+            audio_buffer.drain(..drop_count);
+        }
 
-                    // Transcribe segment
-                    match engine.transcribe(&segment.samples) {
-                        Ok(result) => {
-                            if !result.text.is_empty() {
-                                let offset_ms = (segment.start * 1000.0) as i64;
-                                output.write(&result, offset_ms)?;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Transcription error: {}", e);
-                        }
-                    }
-                }
+        // Process when we have enough samples
+        if audio_buffer.len() >= window_samples {
+            let window: Vec<f32> = audio_buffer.drain(..window_samples).collect();
+
+            // Calculate RMS energy to detect silence
+            let energy: f32 = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+
+            if energy < silence_threshold {
+                // Skip silent chunk
+                continue;
             }
 
-            // Also accumulate for window-based processing
-            audio_buffer.extend(&processed);
+            let offset_ms = start_time.elapsed().as_millis() as i64 - (window_seconds * 1000.0) as i64;
 
-            // Process accumulated buffer if enough samples
-            if audio_buffer.len() >= window_samples
-                && last_transcription.elapsed() >= Duration::from_secs(3)
-            {
-                let window: Vec<f32> = audio_buffer.drain(..window_samples).collect();
-
-                match engine.transcribe(&window) {
-                    Ok(result) => {
-                        if !result.text.is_empty() {
-                            let _offset_ms = start_time.elapsed().as_millis() as i64
-                                - (window_duration * 1000.0) as i64;
-                            // Only output if VAD-based segments didn't catch it
-                            debug!("Window transcription: {}", result.text);
-                        }
-                    }
-                    Err(e) => {
-                        debug!("Window transcription error: {}", e);
-                    }
-                }
-
-                last_transcription = Instant::now();
-
-                // Keep overlap
-                let overlap = window_samples / 2;
-                if audio_buffer.len() > overlap {
-                    audio_buffer.drain(0..(audio_buffer.len() - overlap));
+            if let Ok(result) = engine.transcribe(&window) {
+                if !result.text.is_empty() {
+                    output.write(&result, offset_ms)?;
                 }
             }
         }
     }
 
     // Flush remaining audio
-    if let Some(segment) = segmenter.flush() {
-        if segment.samples.len() >= 16000 / 4 {
-            if let Ok(result) = engine.transcribe(&segment.samples) {
-                if !result.text.is_empty() {
-                    let offset_ms = (segment.start * 1000.0) as i64;
-                    output.write(&result, offset_ms)?;
-                }
+    if audio_buffer.len() >= 8000 {
+        // At least 0.5s
+        if let Ok(result) = engine.transcribe(&audio_buffer) {
+            if !result.text.is_empty() {
+                let offset_ms = start_time.elapsed().as_millis() as i64;
+                output.write(&result, offset_ms)?;
             }
         }
     }
