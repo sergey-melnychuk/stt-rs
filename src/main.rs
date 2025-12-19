@@ -7,10 +7,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tracing::{info, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
-use stt_rs::{AudioCapture, AudioPreprocessor, Config, OutputWriter, SttEngine};
+use stt_rs::{
+    AudioCapture, AudioPreprocessor, Config, OutputWriter, SpeechSegment, SpeechSegmenter,
+    SttEngine,
+};
 
 /// Radio Speech-to-Text System
 #[derive(Parser)]
@@ -56,6 +59,18 @@ enum Commands {
         /// Disable console output
         #[arg(long)]
         no_console: bool,
+
+        /// Disable audio filtering (high-pass/low-pass)
+        #[arg(long)]
+        no_filter: bool,
+
+        /// Disable audio normalization
+        #[arg(long)]
+        no_normalize: bool,
+
+        /// Enable noise reduction
+        #[arg(long)]
+        noise_reduce: bool,
     },
 
     /// List available audio input devices
@@ -93,6 +108,21 @@ enum Commands {
         #[arg(short, long)]
         language: Option<String>,
     },
+
+    /// Download a Whisper model
+    DownloadModel {
+        /// Model size (tiny, base, small, medium, large)
+        #[arg(short, long, default_value = "base")]
+        size: String,
+
+        /// Download English-only model (smaller, faster)
+        #[arg(long)]
+        english_only: bool,
+
+        /// Output directory for models
+        #[arg(short, long, default_value = "./models")]
+        output_dir: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -108,10 +138,7 @@ fn main() -> Result<()> {
     };
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive(log_level.into()),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive(log_level.into()))
         .init();
 
     // Load configuration
@@ -130,6 +157,9 @@ fn main() -> Result<()> {
             format,
             language,
             no_console,
+            no_filter,
+            no_normalize,
+            noise_reduce,
         } => {
             // Apply CLI overrides
             if let Some(device) = device {
@@ -151,6 +181,17 @@ fn main() -> Result<()> {
                 _ => stt_rs::config::OutputFormat::Text,
             };
             config.output.enable_console = !no_console;
+
+            // Allow disabling filtering/normalization via CLI flags
+            if no_filter {
+                config.preprocessing.enable_filtering = false;
+            }
+            if no_normalize {
+                config.preprocessing.enable_normalization = false;
+            }
+            if noise_reduce {
+                config.preprocessing.enable_noise_reduction = true;
+            }
 
             run_realtime(config)
         }
@@ -185,10 +226,100 @@ fn main() -> Result<()> {
             };
             transcribe_file(config, input)
         }
+        Commands::DownloadModel {
+            size,
+            english_only,
+            output_dir,
+        } => download_model(&size, english_only, &output_dir),
     }
 }
 
-/// Run real-time transcription
+/// Statistics for real-time transcription
+struct TranscriptionStats {
+    total_segments: u64,
+    total_errors: u64,
+    dropped_segments: u64,
+    start_time: Instant,
+}
+
+impl TranscriptionStats {
+    fn new() -> Self {
+        Self {
+            total_segments: 0,
+            total_errors: 0,
+            dropped_segments: 0,
+            start_time: Instant::now(),
+        }
+    }
+
+    fn log_summary(&self) {
+        let duration = self.start_time.elapsed();
+        info!(
+            "Session complete: {} segments processed, {} errors, {} dropped, duration: {:.1}s",
+            self.total_segments,
+            self.total_errors,
+            self.dropped_segments,
+            duration.as_secs_f32()
+        );
+    }
+}
+
+/// Process a single speech segment through the STT engine
+fn process_segment(
+    segment: &SpeechSegment,
+    engine: &SttEngine,
+    output: &mut OutputWriter,
+    stats: &mut TranscriptionStats,
+    min_duration: f32,
+) {
+    let duration = segment.end - segment.start;
+
+    // Skip segments that are too short
+    if duration < min_duration {
+        debug!(
+            "Skipping short segment: {:.2}s < {:.2}s minimum",
+            duration, min_duration
+        );
+        return;
+    }
+
+    stats.total_segments += 1;
+    debug!(
+        "Processing segment {}: {:.2}s - {:.2}s ({} samples)",
+        stats.total_segments,
+        segment.start,
+        segment.end,
+        segment.samples.len()
+    );
+
+    match engine.transcribe(&segment.samples) {
+        Ok(result) => {
+            if !result.text.is_empty() {
+                let offset_ms = (segment.start * 1000.0) as i64;
+                if let Err(e) = output.write(&result, offset_ms) {
+                    error!("Failed to write output: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            stats.total_errors += 1;
+            warn!(
+                "Transcription error on segment {} ({:.2}s): {}",
+                stats.total_segments, duration, e
+            );
+        }
+    }
+}
+
+/// Initialize audio capture with optional device reconnection
+fn init_audio_capture(config: &Config) -> Result<AudioCapture> {
+    let mut capture = AudioCapture::new(config.audio.clone())
+        .context("Failed to create audio capture")?;
+    capture.init().context("Failed to initialize audio capture")?;
+    Ok(capture)
+}
+
+/// Run real-time transcription using SpeechSegmenter
 fn run_realtime(config: Config) -> Result<()> {
     info!("Starting real-time transcription");
 
@@ -200,113 +331,171 @@ fn run_realtime(config: Config) -> Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    // Initialize audio capture
-    let mut capture = AudioCapture::new(config.audio.clone())
-        .context("Failed to create audio capture")?;
-    capture.init().context("Failed to initialize audio capture")?;
-
-    let actual_sample_rate = capture.actual_sample_rate();
-    info!("Audio capture initialized at {} Hz", actual_sample_rate);
-
-    // Initialize preprocessor - disable filtering, just resample
-    let mut preproc_config = config.preprocessing.clone();
-    preproc_config.enable_filtering = false;
-    preproc_config.enable_normalization = false;
-    let mut preprocessor = AudioPreprocessor::new(
-        preproc_config,
-        actual_sample_rate,
-        16000, // Whisper expects 16kHz
-    )
-    .context("Failed to create audio preprocessor")?;
-
-    // Initialize STT engine
-    info!("Loading STT model from: {}", config.stt.model_path.display());
-    let engine = SttEngine::new(config.stt.clone())
-        .context("Failed to initialize STT engine")?;
-    info!("STT engine initialized");
+    // Initialize STT engine first (most likely to fail if model missing)
+    info!(
+        "Loading STT model from: {}",
+        config.stt.model_path.display()
+    );
+    let engine = SttEngine::new(config.stt.clone()).context("Failed to initialize STT engine")?;
+    info!("STT engine initialized (language: {})", engine.language());
 
     // Initialize output writer
-    let mut output = OutputWriter::new(config.output.clone())
-        .context("Failed to create output writer")?;
+    let mut output =
+        OutputWriter::new(config.output.clone()).context("Failed to create output writer")?;
     output.write_header()?;
 
-    // Audio buffer - 5 second windows
-    let window_seconds = 5.0;
-    let window_samples = (16000.0 * window_seconds) as usize;
-    let mut audio_buffer: Vec<f32> = Vec::with_capacity(window_samples * 2);
+    // Tracking stats
+    let mut stats = TranscriptionStats::new();
+    let min_segment_duration = config.realtime.min_segment_seconds;
+    let enable_degradation = config.realtime.enable_degradation;
+    let max_lag = Duration::from_secs_f32(config.realtime.max_lag_seconds);
 
-    // Energy threshold for silence detection (skip silent chunks)
-    let silence_threshold = 0.01;
-
-    // Max buffer size before dropping old audio (15 seconds = 3 windows)
-    let max_buffer_samples = window_samples * 3;
-
-    // Start capture
-    capture.start().context("Failed to start audio capture")?;
-
-    let start_time = Instant::now();
-    info!("Listening... Press Ctrl+C to stop");
+    // Device reconnection loop
+    let mut reconnect_attempts = 0;
+    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+    const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
     while running.load(Ordering::SeqCst) {
-        // Drain all available audio to prevent buffer overflow
-        let mut got_samples = false;
-        while let Some(samples) = capture.try_receive() {
-            let processed = preprocessor.process(&samples)?;
-            audio_buffer.extend(&processed);
-            got_samples = true;
-        }
-
-        // If no samples available, wait a bit
-        if !got_samples {
-            if let Some(samples) = capture.receive_timeout(Duration::from_millis(50)) {
-                let processed = preprocessor.process(&samples)?;
-                audio_buffer.extend(&processed);
+        // Try to initialize audio capture
+        let capture_result = init_audio_capture(&config);
+        let mut capture = match capture_result {
+            Ok(c) => {
+                reconnect_attempts = 0; // Reset on success
+                c
             }
+            Err(e) => {
+                reconnect_attempts += 1;
+                if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
+                    return Err(e.context("Max reconnection attempts exceeded"));
+                }
+                warn!(
+                    "Audio capture failed (attempt {}/{}): {}. Retrying in {:?}...",
+                    reconnect_attempts, MAX_RECONNECT_ATTEMPTS, e, RECONNECT_DELAY
+                );
+                std::thread::sleep(RECONNECT_DELAY);
+                continue;
+            }
+        };
+
+        let actual_sample_rate = capture.actual_sample_rate();
+        let target_sample_rate = config.realtime.target_sample_rate;
+        info!(
+            "Audio capture initialized at {} Hz (target: {} Hz)",
+            actual_sample_rate, target_sample_rate
+        );
+
+        // Log preprocessing settings
+        info!(
+            "Preprocessing: filtering={}, normalization={}, AGC={}, noise_reduction={}, VAD={}",
+            config.preprocessing.enable_filtering,
+            config.preprocessing.enable_normalization,
+            config.preprocessing.enable_agc,
+            config.preprocessing.enable_noise_reduction,
+            config.preprocessing.enable_vad
+        );
+
+        // Initialize preprocessor
+        let mut preprocessor = match AudioPreprocessor::new(
+            config.preprocessing.clone(),
+            actual_sample_rate,
+            target_sample_rate,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Failed to create preprocessor: {}", e);
+                continue;
+            }
+        };
+
+        // Initialize speech segmenter
+        let mut segmenter = SpeechSegmenter::new(&config.preprocessing, target_sample_rate);
+
+        // Start capture
+        if let Err(e) = capture.start() {
+            error!("Failed to start capture: {}", e);
+            continue;
         }
 
-        // Drop old audio if we're falling behind
-        if audio_buffer.len() > max_buffer_samples {
-            let drop_count = audio_buffer.len() - window_samples;
-            audio_buffer.drain(..drop_count);
-        }
+        info!("Listening... Press Ctrl+C to stop");
 
-        // Process when we have enough samples
-        if audio_buffer.len() >= window_samples {
-            let window: Vec<f32> = audio_buffer.drain(..window_samples).collect();
+        let mut last_process_time = Instant::now();
+        let mut device_error = false;
 
-            // Calculate RMS energy to detect silence
-            let energy: f32 = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
-
-            if energy < silence_threshold {
-                // Skip silent chunk
+        // Main processing loop
+        while running.load(Ordering::SeqCst) && !device_error {
+            // Check for graceful degradation
+            let lag = last_process_time.elapsed();
+            if enable_degradation && lag > max_lag {
+                warn!(
+                    "Processing lag {:.2}s exceeds max {:.2}s, dropping old audio",
+                    lag.as_secs_f32(),
+                    max_lag.as_secs_f32()
+                );
+                // Drain and discard old audio
+                while capture.try_receive().is_some() {
+                    stats.dropped_segments += 1;
+                }
+                segmenter.reset();
+                preprocessor.reset();
+                last_process_time = Instant::now();
                 continue;
             }
 
-            let offset_ms = start_time.elapsed().as_millis() as i64 - (window_seconds * 1000.0) as i64;
-
-            if let Ok(result) = engine.transcribe(&window) {
-                if !result.text.is_empty() {
-                    output.write(&result, offset_ms)?;
+            // Try to receive audio
+            let samples = match capture.receive_timeout(Duration::from_millis(100)) {
+                Some(s) => s,
+                None => {
+                    // Also try non-blocking drain
+                    if let Some(s) = capture.try_receive() {
+                        s
+                    } else {
+                        continue;
+                    }
                 }
+            };
+
+            // Process audio through preprocessing pipeline
+            let processed = match preprocessor.process(&samples) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("Preprocessing error: {}", e);
+                    device_error = true;
+                    break;
+                }
+            };
+
+            // Feed to segmenter and process any complete segments
+            for segment in segmenter.process(&processed) {
+                process_segment(&segment, &engine, &mut output, &mut stats, min_segment_duration);
             }
+
+            last_process_time = Instant::now();
+        }
+
+        // Stop capture
+        capture.stop();
+
+        // Flush remaining segment
+        if let Some(segment) = segmenter.flush() {
+            process_segment(&segment, &engine, &mut output, &mut stats, min_segment_duration);
+        }
+
+        // Secure clear sensitive audio data
+        preprocessor.secure_clear();
+
+        // If we got here due to device error, try to reconnect
+        if device_error && running.load(Ordering::SeqCst) {
+            warn!("Device error detected, attempting reconnection...");
+            std::thread::sleep(RECONNECT_DELAY);
+        } else {
+            // Normal shutdown
+            break;
         }
     }
 
-    // Flush remaining audio
-    if audio_buffer.len() >= 8000 {
-        // At least 0.5s
-        if let Ok(result) = engine.transcribe(&audio_buffer) {
-            if !result.text.is_empty() {
-                let offset_ms = start_time.elapsed().as_millis() as i64;
-                output.write(&result, offset_ms)?;
-            }
-        }
-    }
-
-    capture.stop();
     output.flush()?;
+    stats.log_summary();
 
-    info!("Transcription stopped");
     Ok(())
 }
 
@@ -346,8 +535,10 @@ fn record_audio(config: Config, output_path: PathBuf, duration_secs: u32) -> Res
 
     capture.start()?;
 
-    let start = Instant::now();
-    println!("Recording for {} seconds... Press Ctrl+C to stop early", duration_secs);
+    println!(
+        "Recording for {} seconds... Press Ctrl+C to stop early",
+        duration_secs
+    );
 
     while running.load(Ordering::SeqCst) && samples.len() < target_samples {
         if let Some(chunk) = capture.receive_timeout(Duration::from_millis(100)) {
@@ -355,8 +546,8 @@ fn record_audio(config: Config, output_path: PathBuf, duration_secs: u32) -> Res
         }
 
         // Progress indicator
-        let elapsed = start.elapsed().as_secs();
-        print!("\rRecording: {}s / {}s", elapsed, duration_secs);
+        let elapsed = samples.len() as f32 / sample_rate as f32;
+        print!("\rRecording: {:.1}s / {}s", elapsed, duration_secs);
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
     println!();
@@ -371,8 +562,8 @@ fn record_audio(config: Config, output_path: PathBuf, duration_secs: u32) -> Res
         sample_format: hound::SampleFormat::Float,
     };
 
-    let mut writer = hound::WavWriter::create(&output_path, spec)
-        .context("Failed to create WAV file")?;
+    let mut writer =
+        hound::WavWriter::create(&output_path, spec).context("Failed to create WAV file")?;
 
     for sample in samples {
         writer.write_sample(sample)?;
@@ -389,15 +580,12 @@ fn transcribe_file(config: Config, input_path: PathBuf) -> Result<()> {
     info!("Transcribing: {}", input_path.display());
 
     // Read WAV file
-    let mut reader = hound::WavReader::open(&input_path)
-        .context("Failed to open WAV file")?;
+    let mut reader = hound::WavReader::open(&input_path).context("Failed to open WAV file")?;
 
     let spec = reader.spec();
     info!(
         "WAV format: {} channels, {} Hz, {} bits",
-        spec.channels,
-        spec.sample_rate,
-        spec.bits_per_sample
+        spec.channels, spec.sample_rate, spec.bits_per_sample
     );
 
     // Read samples
@@ -423,19 +611,24 @@ fn transcribe_file(config: Config, input_path: PathBuf) -> Result<()> {
         samples
     };
 
-    // Resample to 16kHz if needed
-    let processed_samples = if spec.sample_rate != 16000 {
+    // Resample to target rate if needed
+    let target_sample_rate = config.realtime.target_sample_rate;
+    let processed_samples = if spec.sample_rate != target_sample_rate {
         let mut preprocessor = AudioPreprocessor::new(
             config.preprocessing.clone(),
             spec.sample_rate,
-            16000,
+            target_sample_rate,
         )?;
         preprocessor.process(&mono_samples)?
     } else {
         mono_samples
     };
 
-    info!("Loaded {} samples ({:.2}s)", processed_samples.len(), processed_samples.len() as f32 / 16000.0);
+    info!(
+        "Loaded {} samples ({:.2}s)",
+        processed_samples.len(),
+        processed_samples.len() as f32 / target_sample_rate as f32
+    );
 
     // Initialize STT engine
     let engine = SttEngine::new(config.stt)?;
@@ -447,6 +640,81 @@ fn transcribe_file(config: Config, input_path: PathBuf) -> Result<()> {
     let mut output = OutputWriter::new(config.output)?;
     output.write_header()?;
     output.write(&result, 0)?;
+
+    Ok(())
+}
+
+/// Download a Whisper model from Hugging Face
+fn download_model(size: &str, english_only: bool, output_dir: &PathBuf) -> Result<()> {
+    // Validate model size
+    let valid_sizes = ["tiny", "base", "small", "medium", "large"];
+    if !valid_sizes.contains(&size) {
+        anyhow::bail!(
+            "Invalid model size '{}'. Valid sizes: {}",
+            size,
+            valid_sizes.join(", ")
+        );
+    }
+
+    // Construct filename and URL
+    let suffix = if english_only { ".en" } else { "" };
+    let filename = format!("ggml-{}{}.bin", size, suffix);
+    let url = format!(
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
+        filename
+    );
+
+    // Create output directory
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("Failed to create directory: {}", output_dir.display()))?;
+
+    let output_path = output_dir.join(&filename);
+
+    // Check if already exists
+    if output_path.exists() {
+        println!("Model already exists: {}", output_path.display());
+        println!("Delete it first if you want to re-download.");
+        return Ok(());
+    }
+
+    println!("Downloading {} model...", size);
+    println!("URL: {}", url);
+    println!("Destination: {}", output_path.display());
+    println!();
+
+    // Convert path to string, handling non-UTF8 gracefully
+    let output_path_str = output_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Output path contains invalid UTF-8 characters"))?;
+
+    // Use curl for download with progress
+    let status = std::process::Command::new("curl")
+        .args(["-L", "--progress-bar", "-o", output_path_str, &url])
+        .status()
+        .context("Failed to execute curl. Make sure curl is installed.")?;
+
+    if !status.success() {
+        anyhow::bail!("Download failed with exit code: {:?}", status.code());
+    }
+
+    // Verify file exists and has reasonable size
+    let metadata = std::fs::metadata(&output_path)
+        .with_context(|| format!("Failed to read downloaded file: {}", output_path.display()))?;
+
+    let size_mb = metadata.len() as f64 / 1_000_000.0;
+    if size_mb < 10.0 {
+        std::fs::remove_file(&output_path)?;
+        anyhow::bail!(
+            "Downloaded file is too small ({:.1} MB). Download may have failed.",
+            size_mb
+        );
+    }
+
+    println!();
+    println!("Download complete: {:.1} MB", size_mb);
+    println!();
+    println!("To use this model:");
+    println!("  stt-rs run -m {}", output_path.display());
 
     Ok(())
 }

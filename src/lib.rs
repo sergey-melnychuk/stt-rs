@@ -43,8 +43,11 @@ pub mod output;
 pub mod stt;
 
 // Re-exports for convenience
-pub use audio::{AudioBuffer, AudioCapture, AudioPreprocessor, VoiceActivityDetector};
-pub use config::{AudioConfig, Config, OutputConfig, PreprocessingConfig, SttConfig};
+pub use audio::{
+    AudioBuffer, AudioCapture, AudioPreprocessor, SpeechSegment, SpeechSegmenter,
+    VoiceActivityDetector, WindowedBuffer,
+};
+pub use config::{AudioConfig, Config, OutputConfig, PreprocessingConfig, RealtimeConfig, SttConfig};
 pub use error::{AudioError, ConfigError, Result, SttEngineError, SttError};
 pub use output::OutputWriter;
 pub use stt::{SttEngine, TranscriptionResult};

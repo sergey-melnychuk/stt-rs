@@ -18,7 +18,6 @@ pub struct VoiceActivityDetector {
     /// Energy threshold for speech detection
     threshold: f32,
     /// Sample rate for time calculations
-    #[allow(dead_code)]
     sample_rate: u32,
     /// Minimum speech duration in samples
     min_speech_samples: usize,
@@ -125,6 +124,11 @@ impl VoiceActivityDetector {
     pub fn energy_average(&self) -> f32 {
         self.energy_avg
     }
+
+    /// Get the sample rate
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
 }
 
 /// Speech segment with timing information
@@ -159,8 +163,8 @@ pub struct SpeechSegmenter {
 impl SpeechSegmenter {
     /// Create a new speech segmenter
     pub fn new(config: &PreprocessingConfig, sample_rate: u32) -> Self {
-        let pre_roll_samples = (0.2 * sample_rate as f32) as usize; // 200ms pre-roll
-        let max_segment_samples = (10.0 * sample_rate as f32) as usize; // 10 second max segment
+        let pre_roll_samples = (config.vad_pre_roll * sample_rate as f32) as usize;
+        let max_segment_samples = (config.vad_max_segment_duration * sample_rate as f32) as usize;
 
         Self {
             vad: VoiceActivityDetector::new(config, sample_rate),
@@ -266,6 +270,8 @@ mod tests {
             vad_threshold: 0.05,
             vad_min_speech_duration: 0.1,
             vad_min_silence_duration: 0.2,
+            vad_pre_roll: 0.2,
+            vad_max_segment_duration: 10.0,
             ..Default::default()
         }
     }

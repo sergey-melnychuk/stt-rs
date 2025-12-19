@@ -20,20 +20,50 @@ enable_filtering = true
 high_pass_cutoff = 300.0
 # Low-pass filter cutoff (Hz) - radio voice band limit
 low_pass_cutoff = 3400.0
-# Enable audio normalization
+# Enable audio normalization (disabled if AGC is on)
 enable_normalization = true
-# Enable Voice Activity Detection
+
+# Noise reduction (spectral subtraction approximation)
+enable_noise_reduction = false
+# Noise reduction strength (0.0 - 1.0, higher = more aggressive)
+noise_reduction_strength = 0.5
+
+# Automatic Gain Control
+enable_agc = true
+# AGC target level (0.0 - 1.0)
+agc_target_level = 0.5
+# AGC attack time (seconds) - how fast to reduce gain
+agc_attack_time = 0.01
+# AGC release time (seconds) - how fast to increase gain
+agc_release_time = 0.1
+
+# Voice Activity Detection
 enable_vad = true
 # VAD energy threshold (0.0 - 1.0)
-vad_threshold = 0.05
-# Minimum speech duration (seconds)
+vad_threshold = 0.01
+# Minimum speech duration before triggering (seconds)
 vad_min_speech_duration = 0.25
-# Minimum silence duration (seconds)
-vad_min_silence_duration = 0.5
+# Minimum silence duration before ending segment (seconds)
+vad_min_silence_duration = 0.3
+# Pre-roll audio to include before speech starts (seconds)
+vad_pre_roll = 0.2
+# Maximum segment duration before forced split (seconds)
+vad_max_segment_duration = 10.0
+
+[realtime]
+# Target sample rate for Whisper (Hz)
+target_sample_rate = 16000
+# Enable graceful degradation when falling behind
+enable_degradation = true
+# Maximum processing lag before dropping segments (seconds)
+max_lag_seconds = 5.0
+# Minimum segment duration to process (seconds)
+min_segment_seconds = 0.5
 
 [stt]
 # Path to Whisper model file
-# Download from: https://huggingface.co/ggerganov/whisper.cpp/tree/main
+# Download with: stt-rs download-model -s base --english-only
+# Or manually from: https://huggingface.co/ggerganov/whisper.cpp/tree/main
 model_path = "./models/ggml-base.en.bin"
 # Model size: tiny, base, small, medium, large
 model_size = "base"
